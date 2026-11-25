@@ -965,6 +965,12 @@ func (a *app) ensureUSBAT() error {
 	if a.demo || a.modem != nil || a.usbAT != nil {
 		return nil
 	}
+	if runtime.GOOS != "darwin" {
+		if strings.TrimSpace(a.discoveryError) != "" {
+			return errors.New(a.discoveryError)
+		}
+		return errors.New("AT serial port is not ready")
+	}
 	if a.currentUSBDevice() == nil {
 		a.port = "未检测到 DJI USB 设备"
 		a.discoveryError = "DJI USB device is not connected"

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -67,10 +68,65 @@ func hasCMEErrorCode(err error, response, code string) bool {
 	return strings.Contains(msg, "+CME ERROR: "+code) || strings.Contains(msg, "+CME ERROR:"+code)
 }
 
+func gpsATCommandOK(modemMode bool, response string, err error) bool {
+	if err != nil || atResponseIsError(response) {
+		return false
+	}
+	if modemMode {
+		return true
+	}
+	return atCommandSucceeded(response)
+}
+
+func parseGSVSatellitesInView(response string) (int, bool) {
+	perTalker := make(map[string]int)
+	for _, line := range strings.Split(strings.ReplaceAll(response, "\r", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		dollar := strings.IndexByte(line, '$')
+		if dollar < 0 {
+			continue
+		}
+		sentence := line[dollar+1:]
+		if star := strings.IndexByte(sentence, '*'); star >= 0 {
+			sentence = sentence[:star]
+		}
+		fields := strings.Split(sentence, ",")
+		if len(fields) < 4 || len(fields[0]) < 5 || !strings.HasSuffix(fields[0], "GSV") {
+			continue
+		}
+		inView, err := strconv.Atoi(strings.TrimSpace(fields[3]))
+		if err != nil || inView < 0 {
+			continue
+		}
+		talker := fields[0][:2]
+		if prev, exists := perTalker[talker]; !exists || inView > prev {
+			perTalker[talker] = inView
+		}
+	}
+	if len(perTalker) == 0 {
+		return 0, false
+	}
+	total := 0
+	for _, count := range perTalker {
+		total += count
+	}
+	return total, true
+}
+
 func (a *app) readGPSLocation() (*gpsFix, error) {
 	response, err := a.runATCommand("AT+QGPSLOC=2", 12*time.Second)
 	if err != nil {
 		if hasCMEErrorCode(err, response, "516") {
+			if !a.demo {
+				if gsvResp, gsvErr := a.runATCommand(`AT+QGPSGNMEA="GSV"`, 3*time.Second); gsvErr == nil {
+					if inView, ok := parseGSVSatellitesInView(gsvResp); ok {
+						if inView > 0 {
+							return nil, fmt.Errorf("模块 GNSS 已开启（当前可见 %d 颗卫星，至少需 4 颗完成定位），请移至窗边或室外后重试", inView)
+						}
+						return nil, fmt.Errorf("模块 GNSS 已开启（当前可见 0 颗卫星），请移至窗边或室外开阔处等待")
+					}
+				}
+			}
 			return nil, fmt.Errorf("暂未获得定位，请移至窗边或室外后重试")
 		}
 		return nil, err
@@ -133,7 +189,7 @@ func (a *app) startGPS(w http.ResponseWriter, _ *http.Request) {
 	response, err := a.runATCommand("AT+QGPS=1", 8*time.Second)
 	// +CME ERROR: 504 means a GNSS session is already active on the module.
 	alreadyActive := hasCMEErrorCode(err, response, "504")
-	if !alreadyActive && (err != nil || !strings.Contains(response, "OK")) {
+	if !alreadyActive && !gpsATCommandOK(a.modem != nil, response, err) {
 		if err == nil {
 			err = fmt.Errorf("模块未确认启动定位")
 		}
@@ -154,7 +210,7 @@ func (a *app) stopGPS(w http.ResponseWriter, _ *http.Request) {
 	response, err := a.runATCommand("AT+QGPSEND", 8*time.Second)
 	// +CME ERROR: 505 means no GNSS session is currently active.
 	alreadyStopped := hasCMEErrorCode(err, response, "505")
-	if !alreadyStopped && (err != nil || !strings.Contains(response, "OK")) {
+	if !alreadyStopped && !gpsATCommandOK(a.modem != nil, response, err) {
 		if err == nil {
 			err = fmt.Errorf("模块未确认停止定位")
 		}
