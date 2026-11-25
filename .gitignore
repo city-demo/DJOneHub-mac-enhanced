@@ -16,6 +16,7 @@ backups/
 # Local runtime data and logs
 *.log
 *.pid
+/需求总结.md
 
 # Editor files
 .idea/

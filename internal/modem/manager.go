@@ -1249,7 +1249,7 @@ func (m *Manager) isURC(line string) bool {
 		return false
 	}
 	// 排除确认为同步命令的异步回显，避免被 URC 处理函数拦截并报“未分类”
-	if strings.HasPrefix(s, "+CSIM:") || strings.HasPrefix(s, "+CGLA:") || strings.HasPrefix(s, "+CCHO:") || strings.HasPrefix(s, "+CMGR:") || strings.HasPrefix(s, "+CMGS:") || strings.HasPrefix(s, "+QENG:") {
+	if strings.HasPrefix(s, "+CSIM:") || strings.HasPrefix(s, "+CGLA:") || strings.HasPrefix(s, "+CCHO:") || strings.HasPrefix(s, "+CMGR:") || strings.HasPrefix(s, "+CMGL:") || strings.HasPrefix(s, "+CPMS:") || strings.HasPrefix(s, "+CMGS:") || strings.HasPrefix(s, "+QENG:") {
 		return false
 	}
 	if strings.HasPrefix(s, "+") || strings.HasPrefix(s, "^") || strings.HasPrefix(s, "$") {

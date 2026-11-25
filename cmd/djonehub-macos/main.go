@@ -92,11 +92,15 @@ type app struct {
 	usbATBackoffUntil time.Time
 	usbATBackoffErr   string
 
-	smsMu          sync.RWMutex
-	smsOperationMu sync.Mutex
-	sms            []receivedSMS
-	smsSendMu      sync.Mutex
-	smsReassembler *smscodec.Reassembler
+	smsMu              sync.RWMutex
+	smsOperationMu     sync.Mutex
+	sms                []receivedSMS
+	smsSendMu          sync.Mutex
+	smsReassembler     *smscodec.Reassembler
+	smsCachePath       string
+	smsWakeCh          chan struct{}
+	smsFirstIncomplete time.Time
+	smsATRunner        func(command string, timeout time.Duration) (string, error)
 
 	smsPollInterval  time.Duration
 	smsAutoCleanupME bool
@@ -327,9 +331,14 @@ func main() {
 			smsPollInterval:  8 * time.Second,
 			smsAutoCleanupME: true,
 			smsReassembler:   smscodec.NewReassembler(),
+			smsCachePath:     defaultSMSCachePath(),
+			smsWakeCh:        make(chan struct{}, 1),
 			callPollInterval: 3 * time.Second,
 			audio:            newAudioRouter(),
 			webConsole:       webConsole,
+		}
+		if err := instance.loadSMSCache(); err != nil {
+			log.Printf("load SMS cache: %v", err)
 		}
 		go instance.startSMSPoller(context.Background())
 		go instance.startCallPoller(context.Background())
@@ -357,6 +366,9 @@ func main() {
 				manager, modErr := modem.New(cfg)
 				if modErr == nil {
 					manager.SetSMSCallback(instance.recordSMS)
+					manager.SetNewSMSHandler(func(_ string) {
+						instance.triggerSMSPoll()
+					})
 					if startErr := manager.Start(); startErr == nil {
 						cleanupModem = manager.Stop
 						instance.modem = manager
@@ -378,7 +390,7 @@ func main() {
 						} else {
 							instance.installESIMManager(esimManager, false)
 						}
-						go manager.CheckAllSMS()
+						instance.triggerSMSPoll()
 						go instance.syncGPSState()
 						return
 					} else {
@@ -447,13 +459,24 @@ func main() {
 	}
 
 	instance := &app{
-		modem: manager, port: port,
-		smsPollInterval: 8 * time.Second, smsAutoCleanupME: true,
+		modem:            manager,
+		port:             port,
+		smsPollInterval:  8 * time.Second,
+		smsAutoCleanupME: true,
+		smsReassembler:   smscodec.NewReassembler(),
+		smsCachePath:     defaultSMSCachePath(),
+		smsWakeCh:        make(chan struct{}, 1),
 		callPollInterval: 3 * time.Second,
 		audio:            newAudioRouter(),
 		webConsole:       webConsole,
 	}
+	if err := instance.loadSMSCache(); err != nil {
+		log.Printf("load SMS cache: %v", err)
+	}
 	manager.SetSMSCallback(instance.recordSMS)
+	manager.SetNewSMSHandler(func(_ string) {
+		instance.triggerSMSPoll()
+	})
 	if err := manager.Start(); err != nil {
 		log.Fatalf("open modem on %s: %v", port, err)
 	}
@@ -476,7 +499,8 @@ func main() {
 		instance.installESIMManager(esimManager, false)
 	}
 
-	go manager.CheckAllSMS()
+	go instance.startSMSPoller(context.Background())
+	instance.triggerSMSPoll()
 	go instance.startCallPoller(context.Background())
 	go instance.startGPSPoller(context.Background())
 	go instance.syncGPSState()
@@ -824,38 +848,6 @@ func (a *app) recordSMS(sender, content string, timestamp time.Time) {
 	}})
 }
 
-func (a *app) mergeSMS(messages []receivedSMS) (newCount int, total int) {
-	a.smsMu.Lock()
-	defer a.smsMu.Unlock()
-	seen := make(map[string]bool, len(a.sms)+len(messages))
-	for _, item := range a.sms {
-		seen[smsCacheKey(item)] = true
-	}
-	for _, item := range messages {
-		if item.Code == "" {
-			item.Code = extractSMSCode(item.Content)
-		}
-		key := smsCacheKey(item)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		a.sms = append(a.sms, item)
-		newCount++
-	}
-	sort.SliceStable(a.sms, func(i, j int) bool {
-		return a.sms[i].Timestamp.After(a.sms[j].Timestamp)
-	})
-	if len(a.sms) > 500 {
-		a.sms = a.sms[:500]
-	}
-	return newCount, len(a.sms)
-}
-
-func smsCacheKey(item receivedSMS) string {
-	return item.Sender + "\x00" + item.Content + "\x00" + item.Timestamp.Format(time.RFC3339Nano)
-}
-
 func (a *app) setSMSPollStatus(err error) {
 	a.smsMu.Lock()
 	defer a.smsMu.Unlock()
@@ -874,10 +866,40 @@ func (a *app) startSMSPoller(ctx context.Context) {
 	}
 	timer := time.NewTimer(1200 * time.Millisecond)
 	defer timer.Stop()
+	resetTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(interval)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-a.smsWakeCh:
+			// 短暂合并连续到达的 +CMTI 分片通知，随后立即拉取。
+			wakeDelay := time.NewTimer(250 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				wakeDelay.Stop()
+				return
+			case <-wakeDelay.C:
+			}
+			for {
+				select {
+				case <-a.smsWakeCh:
+				default:
+					goto runPoll
+				}
+			}
+		runPoll:
+			if err := a.pollSMSOnce(); err != nil {
+				log.Printf("SMS poll failed: %v", err)
+			}
+			resetTimer()
 		case <-timer.C:
 			if err := a.pollSMSOnce(); err != nil {
 				log.Printf("SMS poll failed: %v", err)
@@ -888,29 +910,49 @@ func (a *app) startSMSPoller(ctx context.Context) {
 }
 
 func (a *app) pollSMSOnce() error {
-	if a.demo || a.modem != nil {
+	if a.demo {
 		return nil
 	}
 	a.smsOperationMu.Lock()
 	defer a.smsOperationMu.Unlock()
-	if err := a.ensureUSBAT(); err != nil {
+	if err := a.ensureSMSATReady(); err != nil {
 		a.setSMSPollStatus(err)
 		return err
 	}
-	messages, err := a.readUSBATSMS()
+	messages, meRawCount, meHasIncomplete, err := a.readUSBATSMS()
 	if err != nil {
-		a.resetUSBATIfGone(err)
+		if a.modem == nil {
+			a.resetUSBATIfGone(err)
+		}
 		a.setSMSPollStatus(err)
 		return err
 	}
-	newCount, total := a.mergeSMS(messages)
-	if a.smsAutoCleanupME && len(messages) > 0 {
-		before, after, cleanupErr := a.clearUSBATSMSMemory("ME")
-		if cleanupErr != nil {
-			log.Printf("auto cleanup ME SMS failed: %v", cleanupErr)
-		} else if before != after {
-			log.Printf("auto cleanup ME SMS: %d -> %d", before, after)
+	newCount, total, persistErr := a.mergeSMSWithPersist(messages)
+	if persistErr != nil {
+		a.setSMSPollStatus(persistErr)
+		return persistErr
+	}
+	if a.smsAutoCleanupME && meRawCount > 0 {
+		shouldCleanupME := true
+		if meHasIncomplete {
+			if a.smsFirstIncomplete.IsZero() {
+				a.smsFirstIncomplete = time.Now()
+				shouldCleanupME = false
+			} else if time.Since(a.smsFirstIncomplete) < 2*time.Minute {
+				shouldCleanupME = false
+			}
 		}
+		if shouldCleanupME {
+			a.smsFirstIncomplete = time.Time{}
+			before, after, cleanupErr := a.clearUSBATSMSMemory("ME")
+			if cleanupErr != nil {
+				log.Printf("auto cleanup ME SMS failed: %v", cleanupErr)
+			} else if before != after {
+				log.Printf("auto cleanup ME SMS: %d -> %d", before, after)
+			}
+		}
+	} else if !meHasIncomplete {
+		a.smsFirstIncomplete = time.Time{}
 	}
 	a.setSMSPollStatus(nil)
 	if newCount > 0 {
@@ -1524,22 +1566,28 @@ func parseUSBATQNWInfo(resp string) (mode, duplex, band string, channel uint32) 
 	return mode, duplex, band, channel
 }
 
-func (a *app) readUSBATSMS() ([]receivedSMS, error) {
-	if _, err := a.usbAT.Command("AT+CMGF=0", 3*time.Second); err != nil {
-		return nil, fmt.Errorf("set SMS PDU mode: %w", err)
+func (a *app) readUSBATSMS() ([]receivedSMS, int, bool, error) {
+	if _, err := a.runSMSATCommand("AT+CMGF=0", 3*time.Second); err != nil {
+		return nil, 0, false, fmt.Errorf("set SMS PDU mode: %w", err)
 	}
 	memories := []string{"SM", "ME"}
 	seen := make(map[string]bool)
 	messages := make([]receivedSMS, 0)
 	var errs []string
+	var meRawCount int
+	var meHasIncomplete bool
 	for _, memory := range memories {
-		items, err := a.readUSBATSMSFromMemory(memory)
+		items, rawCount, hasIncomplete, err := a.readUSBATSMSFromMemory(memory)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", memory, err))
 			continue
 		}
+		if memory == "ME" {
+			meRawCount = rawCount
+			meHasIncomplete = hasIncomplete
+		}
 		for _, item := range items {
-			key := item.Sender + "\x00" + item.Content + "\x00" + item.Timestamp.Format(time.RFC3339Nano)
+			key := smsCacheKey(item)
 			if seen[key] {
 				continue
 			}
@@ -1548,24 +1596,25 @@ func (a *app) readUSBATSMS() ([]receivedSMS, error) {
 		}
 	}
 	if len(messages) == 0 && len(errs) == len(memories) {
-		return nil, fmt.Errorf("list SMS failed: %s", strings.Join(errs, "; "))
+		return nil, 0, false, fmt.Errorf("list SMS failed: %s", strings.Join(errs, "; "))
 	}
 	sort.SliceStable(messages, func(i, j int) bool {
 		return messages[i].Timestamp.After(messages[j].Timestamp)
 	})
-	return messages, nil
+	return messages, meRawCount, meHasIncomplete, nil
 }
 
-func (a *app) readUSBATSMSFromMemory(memory string) ([]receivedSMS, error) {
-	if _, err := a.usbAT.Command(fmt.Sprintf(`AT+CPMS="%s","%s","%s"`, memory, memory, memory), 5*time.Second); err != nil {
-		return nil, fmt.Errorf("select storage: %w", err)
+func (a *app) readUSBATSMSFromMemory(memory string) ([]receivedSMS, int, bool, error) {
+	if _, err := a.runSMSATCommand(fmt.Sprintf(`AT+CPMS="%s","%s","%s"`, memory, memory, memory), 5*time.Second); err != nil {
+		return nil, 0, false, fmt.Errorf("select storage: %w", err)
 	}
-	resp, err := a.usbAT.Command("AT+CMGL=4", 15*time.Second)
+	resp, err := a.runSMSATCommand("AT+CMGL=4", 15*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("list SMS: %w", err)
+		return nil, 0, false, fmt.Errorf("list SMS: %w", err)
 	}
 	pdus := parseUSBATCMGL(resp)
 	messages := make([]receivedSMS, 0, len(pdus))
+	incompleteKeys := make(map[string]bool)
 	for _, item := range pdus {
 		msg, concat, err := decodeUSBATPDU(item.header, item.pdu)
 		if err != nil {
@@ -1580,10 +1629,13 @@ func (a *app) readUSBATSMSFromMemory(memory string) ([]receivedSMS, error) {
 			if a.smsReassembler == nil {
 				a.smsReassembler = smscodec.NewReassembler()
 			}
+			concatKey := fmt.Sprintf("%s_%d", msg.Sender, concat.Ref)
 			complete, content := a.smsReassembler.Add(msg.Sender, concat, msg.Content)
 			if !complete {
+				incompleteKeys[concatKey] = true
 				continue
 			}
+			delete(incompleteKeys, concatKey)
 			msg.Content = content
 			log.Printf("USB AT long SMS reassembled: sender=%s segments=%d", msg.Sender, concat.Total)
 		}
@@ -1595,19 +1647,19 @@ func (a *app) readUSBATSMSFromMemory(memory string) ([]receivedSMS, error) {
 	sort.SliceStable(messages, func(i, j int) bool {
 		return messages[i].Timestamp.After(messages[j].Timestamp)
 	})
-	return messages, nil
+	return messages, len(pdus), len(incompleteKeys) > 0, nil
 }
 
 func (a *app) clearUSBATSMSMemory(memory string) (before, after int, err error) {
-	resp, err := a.usbAT.Command(fmt.Sprintf(`AT+CPMS="%s","%s","%s"`, memory, memory, memory), 5*time.Second)
+	resp, err := a.runSMSATCommand(fmt.Sprintf(`AT+CPMS="%s","%s","%s"`, memory, memory, memory), 5*time.Second)
 	if err != nil {
 		return 0, 0, fmt.Errorf("select storage: %w", err)
 	}
 	before = parseUSBATCPMSUsed(resp)
-	if _, err := a.usbAT.Command("AT+CMGD=1,4", 20*time.Second); err != nil {
+	if _, err := a.runSMSATCommand("AT+CMGD=1,4", 20*time.Second); err != nil {
 		return before, 0, fmt.Errorf("delete messages: %w", err)
 	}
-	resp, err = a.usbAT.Command(fmt.Sprintf(`AT+CPMS="%s","%s","%s"`, memory, memory, memory), 5*time.Second)
+	resp, err = a.runSMSATCommand(fmt.Sprintf(`AT+CPMS="%s","%s","%s"`, memory, memory, memory), 5*time.Second)
 	if err != nil {
 		return before, 0, fmt.Errorf("recheck storage: %w", err)
 	}
@@ -1638,12 +1690,6 @@ func (a *app) clearAllUSBATSMS() ([]smsStorageClearResult, error) {
 		})
 	}
 	return results, nil
-}
-
-func (a *app) clearSMSCache() {
-	a.smsMu.Lock()
-	defer a.smsMu.Unlock()
-	a.sms = nil
 }
 
 func parseUSBATCPMSUsed(resp string) int {
@@ -1727,7 +1773,7 @@ func (a *app) smsStatus(w http.ResponseWriter, _ *http.Request) {
 	a.smsMu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"count":           count,
-		"polling":         !a.demo && a.modem == nil,
+		"polling":         !a.demo,
 		"poll_interval_s": int(a.smsPollInterval.Seconds()),
 		"auto_cleanup_me": a.smsAutoCleanupME,
 		"last_poll":       lastPoll,
@@ -1795,19 +1841,14 @@ func (a *app) refreshSMS(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
 		return
 	}
-	if a.modem == nil {
-		if err := a.pollSMSOnce(); err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		a.smsMu.RLock()
-		count := len(a.sms)
-		a.smsMu.RUnlock()
-		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": count})
+	if err := a.pollSMSOnce(); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	go a.modem.CheckAllSMS()
-	writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
+	a.smsMu.RLock()
+	count := len(a.sms)
+	a.smsMu.RUnlock()
+	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": count})
 }
 
 func (a *app) clearModuleSMS(w http.ResponseWriter, _ *http.Request) {
@@ -1815,16 +1856,12 @@ func (a *app) clearModuleSMS(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"cleared": true, "before": 0, "after": 0, "storages": []string{"SM", "ME"}})
 		return
 	}
-	if a.modem != nil {
-		writeError(w, http.StatusServiceUnavailable, "module SMS cleanup is only available through USB AT")
-		return
-	}
-	if err := a.ensureUSBAT(); err != nil {
+	a.smsOperationMu.Lock()
+	defer a.smsOperationMu.Unlock()
+	if err := a.ensureSMSATReady(); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "AT serial port is unavailable: "+err.Error())
 		return
 	}
-	a.smsOperationMu.Lock()
-	defer a.smsOperationMu.Unlock()
 	results, err := a.clearAllUSBATSMS()
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
@@ -3665,6 +3702,7 @@ func writeError(w http.ResponseWriter, status int, message string) {
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
